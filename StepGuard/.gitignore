@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.env
+stepguard.db
+stepguard.db-*
+logs/
+.sandbox/
+results/*
+!results/.gitkeep
+reports/*
+!reports/.gitkeep

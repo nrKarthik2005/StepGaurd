@@ -1,0 +1,103 @@
+# Document processing in a sandbox. Submitting a report to the registry is irreversible
+# and not idempotent (each call creates a new submission).
+name: document_processing
+version: "1.0.0"
+family: document_processing
+environment: document_store
+description: Load a document, validate its structure, generate a report, submit it once.
+
+states: [START, FILE_LOADED, FILE_VALIDATED, REPORT_GENERATED, COMPLETED]
+initial: START
+final: [COMPLETED]
+
+transitions:
+  - {from: START,            action: load_document,     to: FILE_LOADED}
+  - {from: FILE_LOADED,      action: load_document,     to: FILE_LOADED}
+  - {from: FILE_LOADED,      action: validate_document, to: FILE_VALIDATED}
+  - {from: FILE_VALIDATED,   action: validate_document, to: FILE_VALIDATED}
+  - {from: FILE_VALIDATED,   action: generate_report,   to: REPORT_GENERATED}
+  - {from: REPORT_GENERATED, action: generate_report,   to: REPORT_GENERATED}
+  - {from: REPORT_GENERATED, action: submit_report,     to: COMPLETED}
+
+stage_rules:
+  - {stage: COMPLETED,        when: "obs.submissions > 0"}
+  - {stage: REPORT_GENERATED, when: "obs.report_exists and obs.doc_loaded"}
+  - {stage: FILE_VALIDATED,   when: "obs.validated and obs.doc_loaded"}
+  - {stage: FILE_LOADED,      when: "obs.doc_loaded"}
+  - {stage: START,            when: "True"}
+
+invariants:
+  - {name: single_submission, expr: "obs.submissions <= 1", message: "report submitted more than once"}
+
+completion:
+  - {name: submitted_once, expr: "obs.submissions == 1"}
+
+tools:
+  load_document:
+    description: Copy the source document into the working area.
+    args: {filename: {type: str, pattern: "^[a-z0-9_]+\\.txt$"}}
+    output_schema: {doc_id: str, title: str, words: int}
+    effect:    [{name: doc_loaded, expr: "after.doc_loaded and after.doc_sha == task.text_sha"}]
+    unchanged: [{name: doc_unchanged, expr: "after.doc_sha == before.doc_sha"}]
+    idempotent: true
+    reversibility: R
+
+  validate_document:
+    description: Check the title and required sections; record the result.
+    requires: [load_document]
+    args: {doc_id: {type: str}}
+    preconditions:
+      - {name: doc_loaded, expr: "obs.doc_loaded", message: "working document is missing", fix: load_document}
+    output_schema: {valid: bool, issues: list, sections: list}
+    effect:
+      - {name: validation_recorded, expr: "after.validated and after.validation_sha == after.doc_sha"}
+      - {name: document_valid, expr: "after.validation_valid"}
+    unchanged: [{name: no_validation, expr: "after.validation_sha == before.validation_sha"}]
+    idempotent: true
+    reversibility: R
+
+  generate_report:
+    description: Build report.json from the validated document.
+    requires: [validate_document]
+    args: {doc_id: {type: str}}
+    preconditions:
+      - {name: doc_loaded, expr: "obs.doc_loaded", message: "working document is missing", fix: load_document}
+      - {name: doc_validated, expr: "obs.validated and obs.validation_valid and obs.validation_sha == obs.doc_sha", message: "document not validated", fix: validate_document}
+    output_schema: {report_path: str, word_count: int}
+    effect:
+      - {name: report_exists, expr: "after.report_exists and after.report is not None"}
+      - {name: report_matches_source, expr: "get(after.report, 'source_sha256') == after.doc_sha"}
+      - {name: report_sections, expr: "len(get(after.report, 'sections', [])) == 3 and get(after.report, 'word_count', 0) > 0"}
+    unchanged: [{name: report_unchanged, expr: "after.report_sha == before.report_sha"}]
+    idempotent: true
+    reversibility: R
+
+  submit_report:
+    description: Submit the report to the registry (irreversible).
+    requires: [generate_report]
+    args: {report_path: {type: str, pattern: "^working/report\\.json$"}}
+    preconditions:
+      - {name: report_ready, expr: "obs.report_exists and obs.report is not None and get(obs.report, 'source_sha256') == obs.doc_sha", message: "report missing or stale", fix: generate_report}
+    output_schema: {submission_id: str, status: str}
+    effect:
+      - {name: one_new_submission, expr: "after.submissions == before.submissions + 1"}
+      - {name: submitted_current_report, expr: "after.submitted_shas[-1] == before.report_sha"}
+    unchanged: [{name: no_submission, expr: "after.submissions == before.submissions"}]
+    idempotent: false
+    reversibility: I
+    key_fields: [report_path]
+    recovery: [RETRY, RESUME, ESCALATE]
+
+plan:
+  - {tool: load_document,     args: {filename: "$task.filename"}}
+  - {tool: validate_document, args: {doc_id: "$out.load_document.doc_id"}}
+  - {tool: generate_report,   args: {doc_id: "$out.load_document.doc_id"}}
+  - {tool: submit_report,     args: {report_path: "$out.generate_report.report_path"}}
+
+fault_targets:
+  E1: {hook: propose, tool: validate_document, occurrence: 1, inject: generate_report, detail: "report generated before validation"}
+  E2: {hook: propose, tool: validate_document, occurrence: 1, detail: "working document deleted before validation"}
+  E3: {hook: execute, tool: load_document, occurrence: 1, detail: "load_document response loses doc_id"}
+  E4: {hook: execute, tool: generate_report, occurrence: 1, detail: "generate_report reports success but the report is missing or wrong"}
+  E5: {hook: replay, tool: submit_report, occurrence: 1, detail: "submission replayed after a lost acknowledgement"}
+  E6: {hook: execute, tool: submit_report, occurrence: 1, detail: "submission times out before or after it is recorded"}

@@ -1,0 +1,120 @@
+# CSV data pipeline in a sandbox. Exporting the result is irreversible and not idempotent:
+# each call creates a new export file.
+name: data_pipeline
+version: "1.0.0"
+family: data_pipeline
+environment: csv_pipeline
+description: Load a CSV, validate rows and columns, aggregate revenue per region, verify, export once.
+
+states: [START, DATA_LOADED, DATA_VALIDATED, DATA_TRANSFORMED, OUTPUT_VERIFIED, COMPLETED]
+initial: START
+final: [COMPLETED]
+
+transitions:
+  - {from: START,            action: load_data,      to: DATA_LOADED}
+  - {from: DATA_LOADED,      action: load_data,      to: DATA_LOADED}
+  - {from: DATA_LOADED,      action: validate_data,  to: DATA_VALIDATED}
+  - {from: DATA_VALIDATED,   action: validate_data,  to: DATA_VALIDATED}
+  - {from: DATA_VALIDATED,   action: transform_data, to: DATA_TRANSFORMED}
+  - {from: DATA_TRANSFORMED, action: transform_data, to: DATA_TRANSFORMED}
+  - {from: DATA_TRANSFORMED, action: verify_output,  to: OUTPUT_VERIFIED}
+  - {from: OUTPUT_VERIFIED,  action: export_output,  to: COMPLETED}
+
+stage_rules:
+  - {stage: COMPLETED,        when: "obs.exports > 0"}
+  - {stage: OUTPUT_VERIFIED,  when: "obs.verified and obs.verified_sha == obs.output_sha"}
+  - {stage: DATA_TRANSFORMED, when: "obs.output_exists"}
+  - {stage: DATA_VALIDATED,   when: "obs.validated_exists"}
+  - {stage: DATA_LOADED,      when: "obs.raw_exists"}
+  - {stage: START,            when: "True"}
+
+invariants:
+  - {name: single_export, expr: "obs.exports <= 1", message: "result exported more than once"}
+
+completion:
+  - {name: exported_once, expr: "obs.exports == 1"}
+
+tools:
+  load_data:
+    description: Copy the source CSV into the work area.
+    args: {source: {type: str, pattern: "^source/input\\.csv$"}}
+    output_schema: {path: str, rows: int, columns: list}
+    effect:
+      - {name: raw_loaded, expr: "after.raw_exists and after.raw_rows == task.input_rows"}
+      - {name: required_columns, expr: "count(after.raw_columns, 'region') == 1 and count(after.raw_columns, 'quantity') == 1 and count(after.raw_columns, 'unit_price') == 1"}
+    unchanged: [{name: raw_unchanged, expr: "after.raw_rows == before.raw_rows and after.raw_exists == before.raw_exists"}]
+    idempotent: true
+    reversibility: R
+
+  validate_data:
+    description: Keep rows with a region, positive quantity and non-negative price.
+    requires: [load_data]
+    args: {path: {type: str, pattern: "^work/raw\\.csv$"}}
+    preconditions:
+      - {name: raw_exists, expr: "obs.raw_exists", message: "raw data file is missing", fix: load_data}
+    output_schema: {path: str, valid_rows: int, rejected_rows: int}
+    effect:
+      - {name: validated_written, expr: "after.validated_exists and 0 < after.validated_rows <= after.raw_rows"}
+      - {name: rows_accounted, expr: "after.validated_rows + output.rejected_rows == after.raw_rows"}
+    unchanged: [{name: no_validation, expr: "after.validated_exists == before.validated_exists and after.validated_rows == before.validated_rows"}]
+    idempotent: true
+    reversibility: R
+
+  transform_data:
+    description: Aggregate revenue and order counts per region into output.csv.
+    requires: [validate_data]
+    args: {path: {type: str, pattern: "^work/validated\\.csv$"}}
+    preconditions:
+      - {name: validated_exists, expr: "obs.validated_exists", message: "validated data is missing", fix: validate_data}
+    output_schema: {output_path: str, rows: int}
+    effect:
+      - {name: output_exists, expr: "after.output_exists"}
+      - {name: output_columns, expr: "after.output_columns == ['region', 'revenue', 'orders']"}
+      - {name: one_row_per_region, expr: "after.output_rows == after.validated_regions"}
+      - {name: totals_preserved, expr: "abs(after.output_total - after.validated_total) < 0.01"}
+    unchanged: [{name: output_unchanged, expr: "after.output_sha == before.output_sha"}]
+    idempotent: true
+    reversibility: R
+
+  verify_output:
+    description: Independently re-check the output against the validated data.
+    requires: [transform_data]
+    args: {output_path: {type: str, pattern: "^work/output\\.csv$"}}
+    preconditions:
+      - {name: output_exists, expr: "obs.output_exists", message: "output file is missing", fix: transform_data}
+    output_schema: {verified: bool, checksum: str}
+    effect:    [{name: verified_current_output, expr: "after.verified and after.verified_sha == after.output_sha"}]
+    unchanged: [{name: not_verified, expr: "after.verified_sha == before.verified_sha"}]
+    idempotent: true
+    reversibility: R
+
+  export_output:
+    description: Export the verified output (irreversible).
+    requires: [verify_output]
+    args: {output_path: {type: str, pattern: "^work/output\\.csv$"}}
+    preconditions:
+      - {name: output_verified, expr: "obs.verified and obs.verified_sha == obs.output_sha", message: "output not verified in its current form", fix: verify_output}
+    output_schema: {export_id: str, status: str}
+    effect:
+      - {name: one_new_export, expr: "after.exports == before.exports + 1"}
+      - {name: exported_verified_output, expr: "after.export_shas[-1] == before.output_sha"}
+    unchanged: [{name: no_export, expr: "after.exports == before.exports"}]
+    idempotent: false
+    reversibility: I
+    key_fields: [output_path]
+    recovery: [RETRY, RESUME, ESCALATE]
+
+plan:
+  - {tool: load_data,      args: {source: "source/input.csv"}}
+  - {tool: validate_data,  args: {path: "$out.load_data.path"}}
+  - {tool: transform_data, args: {path: "$out.validate_data.path"}}
+  - {tool: verify_output,  args: {output_path: "$out.transform_data.output_path"}}
+  - {tool: export_output,  args: {output_path: "$out.transform_data.output_path"}}
+
+fault_targets:
+  E1: {hook: propose, tool: verify_output, occurrence: 1, inject: export_output, detail: "export proposed before verification"}
+  E2: {hook: propose, tool: validate_data, occurrence: 1, detail: "raw data file deleted before validation"}
+  E3: {hook: execute, tool: transform_data, occurrence: 1, detail: "transform_data response loses output_path"}
+  E4: {hook: execute, tool: transform_data, occurrence: 1, detail: "transform_data reports success but output is missing or wrong"}
+  E5: {hook: replay, tool: export_output, occurrence: 1, detail: "export replayed after a lost acknowledgement"}
+  E6: {hook: execute, tool: export_output, occurrence: 1, detail: "export times out before or after the file is written"}

@@ -1,0 +1,99 @@
+# File management in a temporary sandbox. Publishing is irreversible and not idempotent:
+# each call creates a new published version.
+name: file_management
+version: "1.0.0"
+family: file_management
+environment: file_store
+description: Create a file, validate it, publish one copy, verify the published copy.
+
+states: [START, FILE_CREATED, FILE_VALIDATED, FILE_PUBLISHED, COMPLETED]
+initial: START
+final: [COMPLETED]
+
+transitions:
+  - {from: START,          action: create_file,        to: FILE_CREATED}
+  - {from: FILE_CREATED,   action: create_file,        to: FILE_CREATED}
+  - {from: FILE_CREATED,   action: validate_file,      to: FILE_VALIDATED}
+  - {from: FILE_VALIDATED, action: validate_file,      to: FILE_VALIDATED}
+  - {from: FILE_VALIDATED, action: publish_file,       to: FILE_PUBLISHED}
+  - {from: FILE_PUBLISHED, action: verify_publication, to: COMPLETED}
+
+stage_rules:
+  - {stage: COMPLETED,      when: "obs.verified"}
+  - {stage: FILE_PUBLISHED, when: "obs.published_count > 0"}
+  - {stage: FILE_VALIDATED, when: "obs.validated and obs.file_exists and obs.validated_sha == obs.file_sha"}
+  - {stage: FILE_CREATED,   when: "obs.file_exists"}
+  - {stage: START,          when: "True"}
+
+invariants:
+  - {name: single_publication, expr: "obs.published_count <= 1", message: "file published more than once"}
+
+completion:
+  - {name: published_and_verified, expr: "obs.verified and obs.published_count == 1"}
+
+tools:
+  create_file:
+    description: Write the requested content into the workspace.
+    args:
+      name: {type: str, pattern: "^[A-Za-z0-9_.-]+$"}
+      content: {type: str}
+    output_schema: {path: str, bytes: int, sha256: str}
+    effect:    [{name: content_written, expr: "after.file_exists and after.file_sha == sha256(args.content)"}]
+    unchanged: [{name: file_unchanged, expr: "after.file_sha == before.file_sha"}]
+    idempotent: true
+    reversibility: R
+
+  validate_file:
+    description: Check the file is non-empty UTF-8 text; record its hash.
+    requires: [create_file]
+    args: {path: {type: str, pattern: "^workspace/[A-Za-z0-9_.-]+$"}}
+    preconditions:
+      - {name: file_exists, expr: "obs.file_exists", message: "workspace file is missing", fix: create_file}
+    output_schema: {valid: bool, lines: int, sha256: str}
+    effect:
+      - {name: validation_recorded, expr: "after.validated and after.validated_sha == after.file_sha and after.validated_ok"}
+    unchanged: [{name: no_validation, expr: "after.validated_sha == before.validated_sha"}]
+    idempotent: true
+    reversibility: R
+
+  publish_file:
+    description: Publish a copy of the validated file (irreversible).
+    requires: [validate_file]
+    args: {path: {type: str, pattern: "^workspace/[A-Za-z0-9_.-]+$"}}
+    preconditions:
+      - {name: file_validated, expr: "obs.validated and obs.validated_ok and obs.validated_sha == obs.file_sha", message: "file not validated in its current form", fix: validate_file}
+    output_schema: {published_path: str, version: int}
+    effect:
+      - {name: one_new_publication, expr: "after.published_count == before.published_count + 1"}
+      - {name: published_validated_copy, expr: "after.published[-1].sha == before.validated_sha"}
+    unchanged: [{name: no_publication, expr: "after.published_count == before.published_count"}]
+    idempotent: false
+    reversibility: I
+    key_fields: [path]
+    recovery: [RETRY, RESUME, ESCALATE]
+
+  verify_publication:
+    description: Compare the published copy with the validated hash.
+    requires: [publish_file]
+    args: {published_path: {type: str, pattern: "^published/.+$"}}
+    preconditions:
+      - {name: published, expr: "obs.published_count > 0", message: "nothing published", fix: publish_file}
+    output_schema: {verified: bool}
+    effect:    [{name: verified, expr: "after.verified"}]
+    unchanged: [{name: not_verified, expr: "not after.verified"}]
+    idempotent: true
+    reversibility: R
+
+plan:
+  - {tool: create_file,        args: {name: "$task.name", content: "$task.content"}}
+  - {tool: validate_file,      args: {path: "$out.create_file.path"}}
+  - {tool: publish_file,       args: {path: "$out.create_file.path"}}
+  - {tool: verify_publication, args: {published_path: "$out.publish_file.published_path"}}
+
+fault_targets:
+  E1: {hook: propose, tool: validate_file, occurrence: 1, inject: publish_file, detail: "publish proposed before validation"}
+  E2: {hook: propose, tool: validate_file, occurrence: 1, detail: "workspace file deleted before validation"}
+  E3: {hook: execute, tool: create_file, occurrence: 1, detail: "create_file response loses the path"}
+  E4: {hook: execute, tool: create_file, occurrence: 1, detail: "create_file reports success but the file is missing or wrong"}
+  E5: {hook: replay, tool: publish_file, occurrence: 1, detail: "publish request replayed after a lost acknowledgement"}
+  E6: {hook: execute, tool: publish_file, occurrence: 1, detail: "publish times out before or after the copy is made"}

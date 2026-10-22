@@ -1,0 +1,149 @@
+# Simulated order processing. No real payment is made; `checkout` is treated as
+# irreversible and NOT idempotent inside the simulation (calling it twice charges twice).
+name: order_processing
+version: "1.0.0"
+family: order_processing
+environment: order_service
+description: Authenticate, create a cart, add the requested items, check out once, confirm.
+
+states: [START, AUTHENTICATED, CART_CREATED, ITEM_ADDED, CHECKOUT_COMPLETED, CONFIRMED]
+initial: START
+final: [CONFIRMED]
+
+transitions:
+  - {from: START,              action: authenticate,  to: AUTHENTICATED}
+  - {from: AUTHENTICATED,      action: authenticate,  to: AUTHENTICATED}
+  - {from: AUTHENTICATED,      action: create_cart,   to: CART_CREATED}
+  - {from: CART_CREATED,       action: authenticate,  to: CART_CREATED}
+  - {from: CART_CREATED,       action: create_cart,   to: CART_CREATED}
+  - {from: CART_CREATED,       action: add_item,      to: ITEM_ADDED}
+  - {from: ITEM_ADDED,         action: authenticate,  to: ITEM_ADDED}
+  - {from: ITEM_ADDED,         action: create_cart,   to: ITEM_ADDED}
+  - {from: ITEM_ADDED,         action: add_item,      to: ITEM_ADDED}
+  - {from: ITEM_ADDED,         action: checkout,      to: CHECKOUT_COMPLETED}
+  - {from: CHECKOUT_COMPLETED, action: confirm_order, to: CONFIRMED}
+
+# Abstraction alpha(s): first matching rule wins.
+stage_rules:
+  - {stage: CONFIRMED,          when: "obs.confirmed"}
+  - {stage: CHECKOUT_COMPLETED, when: "obs.order_count > 0"}
+  - {stage: ITEM_ADDED,         when: "len(obs.cart) > 0"}
+  - {stage: CART_CREATED,       when: "obs.cart_id is not None"}
+  - {stage: AUTHENTICATED,      when: "obs.session_valid"}
+  - {stage: START,              when: "True"}
+
+invariants:
+  - {name: single_charge,      expr: "obs.charges <= 1", message: "more than one charge recorded"}
+  - {name: non_negative_cart,  expr: "min([0] + values(obs.cart)) >= 0", message: "negative quantity in cart"}
+
+completion:
+  - {name: confirmed_once, expr: "obs.confirmed and obs.charges == 1"}
+
+tools:
+  authenticate:
+    description: Obtain a session token.
+    args: {user: {type: str}}
+    output_schema: {token: str, expires_in: int}
+    effect:    [{name: session_valid, expr: "after.session_valid"}]
+    unchanged: [{name: no_session, expr: "not after.session_valid"}]
+    idempotent: true
+    reversibility: R
+
+  create_cart:
+    description: Create (or return) the open cart.
+    requires: [authenticate]
+    preconditions:
+      - {name: session_valid, expr: "obs.session_valid", message: "session expired", fix: authenticate}
+    output_schema: {cart_id: str}
+    effect:    [{name: cart_exists, expr: "after.cart_id is not None"}]
+    unchanged: [{name: no_cart, expr: "after.cart_id == before.cart_id"}]
+    idempotent: true
+    reversibility: R
+
+  add_item:
+    description: Add a quantity of one SKU to the cart.
+    requires: [create_cart]
+    args:
+      cart_id: {type: str}
+      sku: {type: str, pattern: "^[A-Z][0-9]{2}$"}
+      qty: {type: int, min: 1, max: 20}
+    preconditions:
+      - {name: session_valid, expr: "obs.session_valid", message: "session expired", fix: authenticate}
+      - {name: cart_matches, expr: "args.cart_id == obs.cart_id", message: "cart_id does not match the open cart", fix: create_cart}
+      - {name: sku_requested, expr: "args.sku in task.items", message: "SKU was not requested by the user"}
+    output_schema: {status: str, sku: str, qty: int, line_total: float}
+    effect:
+      - {name: qty_increased, expr: "get(after.cart, args.sku, 0) == get(before.cart, args.sku, 0) + args.qty"}
+    unchanged:
+      - {name: qty_unchanged, expr: "get(after.cart, args.sku, 0) == get(before.cart, args.sku, 0)"}
+    idempotent: false
+    reversibility: C
+    key_fields: [sku]
+    compensation: remove_item
+    # compensate the quantity that was actually observed to land, not the requested one
+    compensation_args: {cart_id: args.cart_id, sku: args.sku, qty: "get(after.cart, args.sku, 0) - get(before.cart, args.sku, 0)"}
+
+  remove_item:
+    description: Compensating action for add_item.
+    roles: [recovery, agent]
+    args:
+      cart_id: {type: str}
+      sku: {type: str}
+      qty: {type: int, min: 1}
+    output_schema: {status: str, sku: str}
+    idempotent: false
+    reversibility: R
+    key_fields: [sku]
+
+  checkout:
+    description: Charge the customer and create the order (irreversible in the simulation).
+    requires: [add_item]
+    args: {cart_id: {type: str}}
+    preconditions:
+      - {name: session_valid, expr: "obs.session_valid", message: "session expired", fix: authenticate}
+      - {name: cart_matches, expr: "args.cart_id == obs.cart_id", message: "cart_id does not match the open cart", fix: create_cart}
+      - {name: cart_complete, predicate: cart_matches_request, message: "cart does not match the requested items"}
+    output_schema: {order_id: str, status: str, amount: float, items: dict}
+    effect:
+      - {name: one_new_order, expr: "after.order_count == before.order_count + 1"}
+      - {name: order_items, expr: "after.orders[-1].items == before.cart"}
+      - {name: one_new_charge, expr: "after.charges == before.charges + 1"}
+    unchanged:
+      - {name: no_charge, expr: "after.charges == before.charges"}
+    idempotent: false
+    reversibility: I
+    key_fields: [cart_id]
+    # if the response is lost (timeout) but the probe shows the order exists, rebuild the result from state
+    resume_output: {order_id: "after.orders[-1].order_id", status: "after.orders[-1].status", items: "after.orders[-1].items"}
+    recovery: [RETRY, RESUME, ESCALATE]
+
+  confirm_order:
+    description: Mark the order as confirmed.
+    requires: [checkout]
+    args: {order_id: {type: str}}
+    preconditions:
+      - {name: session_valid, expr: "obs.session_valid", message: "session expired", fix: authenticate}
+      - {name: order_exists, expr: "args.order_id in pluck(obs.orders, 'order_id')", message: "unknown order"}
+    output_schema: {status: str, order_id: str}
+    effect:    [{name: confirmed, expr: "after.confirmed"}]
+    unchanged: [{name: not_confirmed, expr: "not after.confirmed"}]
+    idempotent: true
+    reversibility: R
+
+# Ideal plan the rule-based agent follows. "$task.x" reads task parameters,
+# "$out.tool.field" reads a field from that tool's last output.
+plan:
+  - {tool: authenticate, args: {user: "$task.user"}}
+  - {tool: create_cart}
+  - {tool: add_item, args: {cart_id: "$out.create_cart.cart_id", sku: "$item.sku", qty: "$item.qty"}, foreach: item_list}
+  - {tool: checkout, args: {cart_id: "$out.create_cart.cart_id"}}
+  - {tool: confirm_order, args: {order_id: "$out.checkout.order_id"}}
+
+# Where each fault type is injected (identical for every configuration).
+fault_targets:
+  E1: {hook: propose, tool: checkout, occurrence: 1, inject: confirm_order, detail: "confirm_order proposed before checkout"}
+  E2: {hook: propose, tool: add_item, occurrence: 1, detail: "session expires before the first add_item"}
+  E3: {hook: execute, tool: create_cart, occurrence: 1, detail: "create_cart response loses cart_id"}
+  E4: {hook: execute, tool: add_item, occurrence: 0, detail: "add_item reports ok but the cart is wrong"}
+  E5: {hook: replay, tool: checkout, occurrence: 1, detail: "checkout request replayed after a lost acknowledgement"}
+  E6: {hook: execute, tool: checkout, occurrence: 1, detail: "checkout times out before or after charging"}
